@@ -35,6 +35,7 @@
 #include "srsue/hdr/metrics_json.h"
 #include "srsue/hdr/metrics_stdout.h"
 #include "srsue/hdr/ue.h"
+#include "srsue/hdr/stack/ue_stack_lte.h"
 #include <boost/program_options.hpp>
 #include <boost/program_options/parsers.hpp>
 #include <csignal>
@@ -43,6 +44,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <sys/stat.h>
+#include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -64,6 +67,35 @@ static std::atomic<bool> running        = {true};
 /**********************************************************************
  *  Program arguments processing
  ***********************************************************************/
+static void parse_simple_sn_config(const std::string& filename, all_args_t* args_sn)
+{
+  std::ifstream file(filename);
+  if (!file.is_open()) return;
+  std::string line;
+  while (std::getline(file, line)) {
+    line.erase(std::remove_if(line.begin(), line.end(), [](unsigned char x) { return std::isspace(x); }), line.end());
+    if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+    auto pos = line.find('=');
+    if (pos != std::string::npos) {
+      std::string key = line.substr(0, pos);
+      std::string val = line.substr(pos + 1);
+      if (key == "device_args") {
+        args_sn->rf.device_args = val;
+      } else if (key == "imsi") {
+        args_sn->stack.usim.imsi = val;
+      } else if (key == "bands") {
+        args_sn->stack.rrc_nr.supported_bands_nr_str = val;
+      } else if (key == "dl_nr_arfcn") {
+        args_sn->stack.rrc_nr.dl_nr_arfcn = std::stoul(val);
+      } else if (key == "ssb_nr_arfcn") {
+        args_sn->stack.rrc_nr.ssb_nr_arfcn = std::stoul(val);
+      } else if (key == "nof_prb" || key == "max_nof_prb") {
+        args_sn->stack.rrc_nr.nof_prb = std::stoul(val);
+      }
+    }
+  }
+}
+
 string config_file;
 
 static int parse_args(all_args_t* args, int argc, char* argv[])
@@ -756,6 +788,46 @@ int main(int argc, char* argv[])
   // Start the log backend.
   srslog::init();
 
+  // Set up custom layer log files in the docs directory if found for the UE.
+  std::string ue_docs_dir = "";
+  for (const char* path : {"/root/internship-repo/docs", "../../../docs", "docs", "../docs", "../../docs"}) {
+    struct stat info;
+    if (stat(path, &info) == 0 && (info.st_mode & S_IFDIR) != 0) {
+      ue_docs_dir = path;
+      break;
+    }
+  }
+
+  if (!ue_docs_dir.empty()) {
+    struct ue_logger_map_t {
+      std::vector<std::string> ids;
+      std::string filename;
+    };
+    std::vector<ue_logger_map_t> log_maps = {
+      {{"PDCP", "PDCP-NR"}, "pdcp.log"},
+      {{"RLC", "RLC-NR"}, "rlc.log"},
+      {{"MAC", "MAC-NR"}, "mac.log"},
+      {{"PHY", "PHY-SA", "PHY_LIB", "PHY0", "PHY1", "PHY2", "PHY3", "PHY4", "PHY5", "PHY6", "PHY7"}, "phy.log"}
+    };
+
+    for (const auto& mapping : log_maps) {
+      std::string log_path = ue_docs_dir + "/ue_" + mapping.filename;
+      
+      // Fetch the file sink
+      auto& file_sink = srslog::fetch_file_sink(log_path);
+      
+      // Register each ID with this custom sink
+      for (const auto& id : mapping.ids) {
+        srslog::fetch_basic_logger(id, file_sink, false);
+      }
+    }
+    
+    // Create symlink for ue_pcds.log
+    std::string pcds_path = ue_docs_dir + "/ue_pcds.log";
+    if (unlink(pcds_path.c_str()) == 0) {}
+    if (symlink("ue_pdcp.log", pcds_path.c_str()) == 0) {}
+  }
+
   srslog::fetch_basic_logger("ALL").set_level(srslog::basic_levels::warning);
   srsran::log_args(argc, argv, "UE");
 
@@ -770,6 +842,34 @@ int main(int argc, char* argv[])
   if (ue.init(args)) {
     ue.stop();
     return SRSRAN_SUCCESS;
+  }
+
+  std::unique_ptr<srsue::ue> ue_sn_ptr;
+  char* sn_config_env = std::getenv("SRSUE_SN_CONFIG");
+  if (sn_config_env) {
+    all_args_t args_sn = args;
+    parse_simple_sn_config(sn_config_env, &args_sn);
+    args_sn.gw.tun_dev_name = "tun_srsue_sn";
+    args_sn.gw.netns = ""; // run in default namespace to avoid setns/netns conflicts
+    
+    ue_sn_ptr.reset(new srsue::ue());
+    if (ue_sn_ptr->init(args_sn)) {
+      ue_sn_ptr->stop();
+      ue.stop();
+      return SRSRAN_SUCCESS;
+    }
+
+    ue_stack_lte* stack_mn = dynamic_cast<ue_stack_lte*>(ue.get_stack());
+    ue_stack_lte* stack_sn = dynamic_cast<ue_stack_lte*>(ue_sn_ptr->get_stack());
+    if (stack_mn && stack_sn) {
+      srsran::pdcp* pdcp_mn = stack_mn->get_pdcp_nr();
+      srsran::rlc*  rlc_sn  = stack_sn->get_rlc_nr();
+
+      rlc_sn->set_pdcp(pdcp_mn);
+      pdcp_mn->set_rlc_sn(rlc_sn);
+
+      cout << "Monolithic Stack: Linked SN RLC directly to MN PDCP via C++ pointers." << endl;
+    }
   }
 
   srsran::metrics_hub<ue_metrics_t> metricshub;
@@ -806,6 +906,9 @@ int main(int argc, char* argv[])
 
   cout << "Attaching UE..." << endl;
   ue.switch_on();
+  if (ue_sn_ptr) {
+    ue_sn_ptr->switch_on();
+  }
 
   if (args.gui.enable) {
     ue.start_plot();
@@ -816,11 +919,17 @@ int main(int argc, char* argv[])
   }
 
   ue.switch_off();
+  if (ue_sn_ptr) {
+    ue_sn_ptr->switch_off();
+  }
   pthread_cancel(input);
   pthread_join(input, nullptr);
   metricshub.stop();
   metrics_file.stop();
   ue.stop();
+  if (ue_sn_ptr) {
+    ue_sn_ptr->stop();
+  }
   cout << "---  exiting  ---" << endl;
 
   return SRSRAN_SUCCESS;

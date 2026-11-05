@@ -26,9 +26,176 @@
 #include "srsran/common/task_scheduler.h"
 #include "srsran/interfaces/ue_pdcp_interfaces.h"
 #include "srsran/upper/pdcp_entity_lte.h"
+#include "srsran/interfaces/ue_rlc_interfaces.h"
 #include <set>
+#include <thread>
+#include <atomic>
 
 namespace srsran {
+
+class rlc_split_bridge : public srsue::rlc_interface_pdcp
+{
+  bool parsed = false;
+  uint32_t ratio_mn = 1;
+  uint32_t ratio_sn = 1;
+  uint32_t total_ratio = 2;
+  bool duplication_mode = false;
+
+  void apply_ratio_str(const char* str)
+  {
+    if (!str) return;
+    std::string s(str);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+
+    if (s == "dup" || s == "duplicate" || s == "duplication" || s.find("dup") != std::string::npos) {
+      duplication_mode = true;
+      ratio_mn = 1;
+      ratio_sn = 1;
+      total_ratio = 2;
+      printf("\n[PDCP Dynamic Switch] Live mode: Packet Duplication ENABLED (URLLC zero-loss dual transmission)\n");
+      fflush(stdout);
+      return;
+    }
+
+    int mn = 1, sn = 1;
+    if (sscanf(s.c_str(), "%d:%d", &mn, &sn) == 2 && mn >= 0 && sn >= 0 && (mn + sn) > 0) {
+      ratio_mn = mn;
+      ratio_sn = sn;
+      total_ratio = mn + sn;
+      duplication_mode = false;
+      printf("\n[PDCP Dynamic Switch] Live mode: Traffic Splitting: MN(DU1)=%d, SN(DU2)=%d (Ratio %d:%d)\n", mn, sn, mn, sn);
+      fflush(stdout);
+    }
+  }
+
+  void parse_ratio()
+  {
+    char* env_ratio = std::getenv("PDCP_SPLIT_RATIO");
+    if (env_ratio) {
+      apply_ratio_str(env_ratio);
+    }
+    parsed = true;
+  }
+
+  void check_runtime_ratio()
+  {
+    FILE* fp = fopen("/tmp/pdcp_split_ratio", "r");
+    if (fp) {
+      char buf[64];
+      if (fgets(buf, sizeof(buf), fp)) {
+        static std::string last_buf = "";
+        std::string cur(buf);
+        if (cur != last_buf) {
+          last_buf = cur;
+          apply_ratio_str(buf);
+        }
+      }
+      fclose(fp);
+    }
+  }
+
+public:
+  srsue::rlc_interface_pdcp* mn_rlc = nullptr;
+  srsue::rlc_interface_pdcp* sn_rlc = nullptr;
+
+  void write_sdu(uint32_t lcid, srsran::unique_byte_buffer_t sdu) override
+  {
+    if (lcid < 3) {
+      if (mn_rlc) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      }
+      return;
+    }
+
+    if (!parsed) {
+      parse_ratio();
+    }
+    check_runtime_ratio();
+
+    static std::atomic<uint32_t> packet_counter{0};
+
+    bool mn_full = mn_rlc ? mn_rlc->sdu_queue_is_full(lcid) : true;
+    bool sn_full = sn_rlc ? sn_rlc->sdu_queue_is_full(lcid) : true;
+
+    // Policy / Hot-Switch Case 1: Pure Satellite Mode (0:1)
+    if (!duplication_mode && ratio_mn == 0 && ratio_sn > 0) {
+      if (sn_rlc && !sn_full) {
+        sn_rlc->write_sdu(lcid, std::move(sdu));
+      } else if (mn_rlc && !mn_full) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      }
+      return;
+    }
+
+    // Policy / Hot-Switch Case 2: Pure Terrestrial Mode (1:0)
+    if (!duplication_mode && ratio_sn == 0 && ratio_mn > 0) {
+      if (mn_rlc && !mn_full) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      } else if (sn_rlc && !sn_full) {
+        sn_rlc->write_sdu(lcid, std::move(sdu));
+      }
+      return;
+    }
+
+    // Case 3A: Packet Duplication Mode (3GPP Rel-15/16 URLLC)
+    // Send identical copy of SDU to both MN and SN simultaneously
+    if (duplication_mode) {
+      if (sn_rlc && !sn_full) {
+        srsran::unique_byte_buffer_t sdu_copy = srsran::make_byte_buffer();
+        if (sdu_copy && sdu) {
+          *sdu_copy = *sdu;
+          sn_rlc->write_sdu(lcid, std::move(sdu_copy));
+        }
+      }
+      if (mn_rlc && !mn_full) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      } else if (sn_rlc && !sn_full) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      }
+      return;
+    }
+
+    // Case 3B: Traffic Splitting Mode (Split Bearer, e.g. 1:1 alternating)
+    // Alternate packets according to configured ratio
+    uint32_t count = packet_counter++ % total_ratio;
+    bool route_to_mn = (count < ratio_mn);
+
+    if (route_to_mn) {
+      if (mn_rlc && !mn_full) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      } else if (sn_rlc && !sn_full) {
+        sn_rlc->write_sdu(lcid, std::move(sdu));
+      }
+    } else {
+      if (sn_rlc && !sn_full) {
+        sn_rlc->write_sdu(lcid, std::move(sdu));
+      } else if (mn_rlc && !mn_full) {
+        mn_rlc->write_sdu(lcid, std::move(sdu));
+      }
+    }
+  }
+
+  void discard_sdu(uint32_t lcid, uint32_t discard_sn) override
+  {
+    if (sn_rlc) sn_rlc->discard_sdu(lcid, discard_sn);
+    if (mn_rlc) mn_rlc->discard_sdu(lcid, discard_sn);
+  }
+
+  bool rb_is_um(uint32_t lcid) override
+  {
+    return mn_rlc ? mn_rlc->rb_is_um(lcid) : false;
+  }
+
+  bool sdu_queue_is_full(uint32_t lcid) override
+  {
+    return mn_rlc ? mn_rlc->sdu_queue_is_full(lcid) : false;
+  }
+
+  bool is_suspended(const uint32_t lcid) override
+  {
+    return mn_rlc ? mn_rlc->is_suspended(lcid) : false;
+  }
+};
 
 class pdcp : public srsue::pdcp_interface_rlc, public srsue::pdcp_interface_rrc
 {
@@ -37,6 +204,8 @@ public:
   virtual ~pdcp();
   void init(srsue::rlc_interface_pdcp* rlc_, srsue::rrc_interface_pdcp* rrc_, srsue::gw_interface_pdcp* gw_);
   void stop();
+  void set_xn_role(const std::string& role);
+  void set_rlc_sn(srsue::rlc_interface_pdcp* rlc_sn_) { rlc_sn = rlc_sn_; split_bridge.sn_rlc = rlc_sn_; }
 
   // Stack interface
   bool is_lcid_enabled(uint32_t lcid);
@@ -80,6 +249,8 @@ public:
 
 private:
   srsue::rlc_interface_pdcp* rlc    = nullptr;
+  srsue::rlc_interface_pdcp* rlc_sn = nullptr;
+  rlc_split_bridge           split_bridge;
   srsue::rrc_interface_pdcp* rrc    = nullptr;
   srsue::gw_interface_pdcp*  gw     = nullptr;
   srsran::task_sched_handle  task_sched;
@@ -97,6 +268,12 @@ private:
 
   // Timer needed for metrics calculation
   std::chrono::high_resolution_clock::time_point metrics_tp;
+  std::string        xn_role = "";
+
+  // Mock Xn-Bridge fields
+  std::thread        xn_rx_thread;
+  std::atomic<bool>  xn_rx_running{false};
+  int                xn_rx_sock = -1;
 };
 
 } // namespace srsran
